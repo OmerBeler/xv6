@@ -34,14 +34,18 @@ struct context {
 
 enum procstate { UNUSED, EMBRYO, SLEEPING, RUNNABLE, RUNNING, ZOMBIE };
 
-// Per-process state
+typedef uint tid_t;
+
+// Per-process state. A "process" in xv6 is a struct proc slot. Threads
+// in the same process are separate struct proc entries that share pgdir,
+// sz, parent, and a logical identity (the leader). See Threads.md.
 struct proc {
   uint sz;                     // Size of process memory (bytes)
-  pde_t* pgdir;                // Page table
+  pde_t* pgdir;                // Page table (shared across threads)
   char *kstack;                // Bottom of kernel stack for this process
   enum procstate state;        // Process state
-  int pid;                     // Process ID
-  struct proc *parent;         // Parent process
+  int pid;                     // Process ID (== TID for thread slots)
+  struct proc *parent;         // Parent process (always the leader's parent)
   struct trapframe *tf;        // Trap frame for current syscall
   struct context *context;     // swtch() here to run process
   void *chan;                  // If non-zero, sleeping on chan
@@ -49,6 +53,13 @@ struct proc {
   struct file *ofile[NOFILE];  // Open files
   struct inode *cwd;           // Current directory
   char name[16];               // Process name (debugging)
+
+  // Threads (see Threads.md).
+  int is_thread;               // 1 if this slot is a non-leader thread
+  struct proc *thread_group;   // Leader of the thread group (NULL on leader)
+  int thread_count;            // Live threads in group incl. leader (leader only)
+  void *thread_exit_value;     // Value passed to thread_exit()
+  int thread_exited;           // Set after thread_exit() stored exit value
 };
 
 // Process memory is laid out contiguously, low addresses first:
