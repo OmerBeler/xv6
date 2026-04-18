@@ -94,3 +94,32 @@ User code calls stub in `usys.S` → kernel trap → `syscall()` dispatches via 
 ## User programs
 
 `init.c` (PID 1) starts `sh.c` (the shell). Standard utilities: `cat`, `ls`, `grep`, `echo`, `wc`, `mkdir`, `rm`, `ln`, `kill`. User library in `ulib.c`/`umalloc.c`; syscall stubs in `usys.S`.
+
+## Manual reference (`docs/Manual.pdf`)
+
+The xv6 book (Cox, Kaashoek, Morris — draft 2016) is at `docs/Manual.pdf`. It is the authoritative explanation of *why* the code is structured the way it is; the source code shows *what*, the manual explains *why*.
+
+### When to consult the manual
+
+| Situation | Manual section |
+|---|---|
+| Understanding the full system call API and how fork/exec/pipe compose | Ch. 0 — Operating system interfaces (p. 7) |
+| Kernel organization decisions: monolithic vs. microkernel, user/kernel mode boundary | Ch. 1 — Operating system organization (p. 17) |
+| Process address space layout, virtual→physical translation, `exec` loading ELF | Ch. 1–2 (p. 20–37) |
+| How x86 paging hardware works; `walkpgdir`, PTE flags, `mappages` | Ch. 2 — Page tables (p. 29) |
+| Trap/interrupt handling, IDT setup, system call entry path, device driver structure | Ch. 3 — Traps, interrupts, and drivers (p. 39) |
+| Lock correctness, spinlock vs. sleeplock, when to hold a lock | Ch. 4 — Locking (p. 51) |
+| Scheduler loop, context switch (`swtch`), sleep/wakeup, process states | Ch. 5 — Scheduling (p. 59) |
+| Buffer cache, write-ahead logging, inode layer, directory lookup, `namei` | Ch. 6 — File system (p. 73) |
+| x86 PC memory map, I/O ports, protected mode, segmentation | Appendix A — PC hardware (p. 91) |
+| Boot loader: real mode → protected mode, loading the kernel ELF | Appendix B — The boot loader (p. 95) |
+
+### What to use where
+
+- **Adding or modifying a system call**: Read Ch. 0 (interface contract) and Ch. 3 (trap entry path) before editing `syscall.c`/`sysproc.c`/`sysfile.c`.
+- **Touching virtual memory or page tables**: Ch. 2 is essential; cross-reference `vm.c` and `mmu.h`.
+- **Working with locks or sleeping**: Ch. 4 explains the invariants; violating them causes deadlock or data races that are hard to reproduce.
+- **Modifying the scheduler or process lifecycle**: Ch. 5 covers the full state machine; check Figure in Ch. 1 for address-space layout.
+- **Filesystem changes**: Ch. 6 explains the 6-layer stack (block → buffer cache → log → inode → directory → path); changes must respect the logging protocol in `log.c`.
+- **Debugging boot or low-level crashes**: Appendix B explains the bootloader; Ch. 1 explains the first address space setup in `entry.S` and `main.c`.
+- **Understanding a design choice that seems odd**: Check the "Real world" section at the end of the relevant chapter — it explains what production OSes do differently and why xv6 simplified.
