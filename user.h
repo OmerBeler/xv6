@@ -24,6 +24,14 @@ char* sbrk(int);
 int sleep(int);
 int uptime(void);
 
+// threads (see Threads.md)
+typedef uint tid_t;
+int  thread_create(tid_t *tid, void *(*entry)(void), void *stack, uint stack_size);
+void thread_exit(void *exit_value) __attribute__((noreturn));
+int  thread_join(tid_t tid, void **exit_value);
+uint thread_getThreadId(void);
+uint thread_getProcessId(void);
+
 // ulib.c
 int stat(const char*, struct stat*);
 char* strcpy(char*, const char*);
