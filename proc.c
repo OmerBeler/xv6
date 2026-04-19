@@ -20,6 +20,15 @@ extern void trapret(void);
 
 static void wakeup1(void *chan);
 
+// Return the leader (group-owning proc) for p. For a non-thread p this is p
+// itself; for a thread slot it is p->thread_group. Uses pointer identity, so
+// safe to call on any live struct proc.
+struct proc *
+thread_leader(struct proc *p)
+{
+  return p->is_thread ? p->thread_group : p;
+}
+
 void
 pinit(void)
 {
@@ -89,6 +98,13 @@ found:
   p->state = EMBRYO;
   p->pid = nextpid++;
 
+  // Thread defaults: fresh slots represent single-threaded processes.
+  p->is_thread = 0;
+  p->thread_group = 0;
+  p->thread_count = 1;
+  p->thread_exit_value = 0;
+  p->thread_exited = 0;
+
   release(&ptable.lock);
 
   // Allocate kernel stack.
@@ -153,23 +169,39 @@ userinit(void)
   release(&ptable.lock);
 }
 
-// Grow current process's memory by n bytes.
+// Grow the current process's memory by n bytes.
 // Return 0 on success, -1 on failure.
+//
+// Thread semantics: pgdir is shared across all threads. We serialize
+// the grow under ptable.lock and propagate the new sz to every thread
+// in the group so their argptr/argint bounds checks stay consistent.
 int
 growproc(int n)
 {
   uint sz;
   struct proc *curproc = myproc();
+  struct proc *leader = thread_leader(curproc);
+  struct proc *p;
 
-  sz = curproc->sz;
+  acquire(&ptable.lock);
+  sz = leader->sz;
   if(n > 0){
-    if((sz = allocuvm(curproc->pgdir, sz, sz + n)) == 0)
+    if((sz = allocuvm(leader->pgdir, sz, sz + n)) == 0){
+      release(&ptable.lock);
       return -1;
+    }
   } else if(n < 0){
-    if((sz = deallocuvm(curproc->pgdir, sz, sz + n)) == 0)
+    if((sz = deallocuvm(leader->pgdir, sz, sz + n)) == 0){
+      release(&ptable.lock);
       return -1;
+    }
   }
-  curproc->sz = sz;
+  for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
+    if(p->state == UNUSED) continue;
+    if(thread_leader(p) == leader)
+      p->sz = sz;
+  }
+  release(&ptable.lock);
   switchuvm(curproc);
   return 0;
 }
@@ -197,7 +229,9 @@ fork(void)
     return -1;
   }
   np->sz = curproc->sz;
-  np->parent = curproc;
+  // Parent is the enclosing process's leader, not the calling thread:
+  // the child's lifetime is tied to the process, not to a single thread.
+  np->parent = thread_leader(curproc);
   *np->tf = *curproc->tf;
 
   // Clear %eax so that fork returns 0 in the child.
@@ -221,20 +255,27 @@ fork(void)
   return pid;
 }
 
-// Exit the current process.  Does not return.
-// An exited process remains in the zombie state
-// until its parent calls wait() to find out it exited.
+// Exit the current process (whole process, including all threads).
+// An exited thread remains ZOMBIE until joined (thread_join) or reaped
+// by the parent via wait() along with its group leader.
+//
+// Thread semantics: any thread calling exit() terminates the entire
+// process. Siblings are asked to die (killed=1, SLEEPING→RUNNABLE);
+// they finish their syscall, trap out, and hit this same function.
 void
 exit(void)
 {
   struct proc *curproc = myproc();
+  struct proc *leader = thread_leader(curproc);
   struct proc *p;
   int fd;
 
   if(curproc == initproc)
     panic("init exiting");
 
-  // Close all open files.
+  // Close this thread's files and release its cwd. Each thread holds
+  // its own ref (filedup/idup at thread_create time), so every thread
+  // balances the refcount on the way out.
   for(fd = 0; fd < NOFILE; fd++){
     if(curproc->ofile[fd]){
       fileclose(curproc->ofile[fd]);
@@ -249,64 +290,111 @@ exit(void)
 
   acquire(&ptable.lock);
 
-  // Parent might be sleeping in wait().
-  wakeup1(curproc->parent);
-
-  // Pass abandoned children to init.
+  // Ask all other members of the group to die. They will observe
+  // killed=1 on their next trap return and re-enter exit() themselves.
   for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
-    if(p->parent == curproc){
+    if(p == curproc) continue;
+    if(p->state == UNUSED) continue;
+    if(thread_leader(p) == leader){
+      p->killed = 1;
+      if(p->state == SLEEPING)
+        p->state = RUNNABLE;
+    }
+  }
+
+  // Reparent the leader's children. Idempotent across multiple exiters.
+  for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
+    if(p->parent == leader){
       p->parent = initproc;
       if(p->state == ZOMBIE)
         wakeup1(initproc);
     }
   }
 
-  // Jump into the scheduler, never to return.
+  // Group bookkeeping: note our departure and wake anyone watching.
+  leader->thread_count--;
+  wakeup1(curproc);          // any thread_join on us
+  wakeup1(leader);           // any exec/thread_exit waiter on the group
+  wakeup1(leader->parent);   // parent's wait() — cheap to call repeatedly
+
   curproc->state = ZOMBIE;
   sched();
   panic("zombie exit");
 }
 
-// Wait for a child process to exit and return its pid.
+// Wait for a child process (not a thread) to exit and return its pid.
 // Return -1 if this process has no children.
+//
+// Thread semantics: wait() reaps at the process level. It only unblocks
+// when a child's entire thread group is ZOMBIE (so it is safe to free
+// the shared pgdir). Thread slots within the same process are never
+// visible as children to wait() — use thread_join for them.
 int
 wait(void)
 {
-  struct proc *p;
+  struct proc *p, *q;
   int havekids, pid;
   struct proc *curproc = myproc();
-  
+  pde_t *to_free;
+
   acquire(&ptable.lock);
   for(;;){
-    // Scan through table looking for exited children.
     havekids = 0;
     for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
       if(p->parent != curproc)
         continue;
+      if(p->is_thread)              // threads are reaped by thread_join
+        continue;
       havekids = 1;
-      if(p->state == ZOMBIE){
-        // Found one.
-        pid = p->pid;
-        kfree(p->kstack);
-        p->kstack = 0;
-        freevm(p->pgdir);
-        p->pid = 0;
-        p->parent = 0;
-        p->name[0] = 0;
-        p->killed = 0;
-        p->state = UNUSED;
-        release(&ptable.lock);
-        return pid;
+      if(p->state != ZOMBIE)
+        continue;
+
+      // Leader is ZOMBIE. Only reap if every group member is ZOMBIE —
+      // otherwise sibling threads may still be executing with this pgdir.
+      int all_zombie = 1;
+      for(q = ptable.proc; q < &ptable.proc[NPROC]; q++){
+        if(q == p) continue;
+        if(q->state == UNUSED) continue;
+        if(thread_leader(q) == p && q->state != ZOMBIE){
+          all_zombie = 0;
+          break;
+        }
       }
+      if(!all_zombie)
+        continue;
+
+      pid = p->pid;
+      to_free = p->pgdir;
+
+      // Reap every slot belonging to the group (leader + threads).
+      for(q = ptable.proc; q < &ptable.proc[NPROC]; q++){
+        if(q->state == UNUSED) continue;
+        if(thread_leader(q) != p) continue;
+        kfree(q->kstack);
+        q->kstack = 0;
+        q->pid = 0;
+        q->parent = 0;
+        q->name[0] = 0;
+        q->killed = 0;
+        q->is_thread = 0;
+        q->thread_group = 0;
+        q->thread_count = 0;
+        q->thread_exit_value = 0;
+        q->thread_exited = 0;
+        q->pgdir = 0;
+        q->sz = 0;
+        q->state = UNUSED;
+      }
+      freevm(to_free);
+      release(&ptable.lock);
+      return pid;
     }
 
-    // No point waiting if we don't have any children.
     if(!havekids || curproc->killed){
       release(&ptable.lock);
       return -1;
     }
 
-    // Wait for children to exit.  (See wakeup1 call in proc_exit.)
     sleep(curproc, &ptable.lock);  //DOC: wait-sleep
   }
 }
@@ -473,24 +561,29 @@ wakeup(void *chan)
   release(&ptable.lock);
 }
 
-// Kill the process with the given pid.
-// Process won't exit until it returns
-// to user space (see trap in trap.c).
+// Kill the process containing the thread/process with the given pid.
+// All threads in the group are asked to exit. They won't actually exit
+// until each returns to user space (see trap in trap.c).
 int
 kill(int pid)
 {
-  struct proc *p;
+  struct proc *p, *q, *leader;
 
   acquire(&ptable.lock);
   for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
-    if(p->pid == pid){
-      p->killed = 1;
-      // Wake process from sleep if necessary.
-      if(p->state == SLEEPING)
-        p->state = RUNNABLE;
-      release(&ptable.lock);
-      return 0;
+    if(p->state == UNUSED) continue;
+    if(p->pid != pid) continue;
+
+    leader = thread_leader(p);
+    for(q = ptable.proc; q < &ptable.proc[NPROC]; q++){
+      if(q->state == UNUSED) continue;
+      if(thread_leader(q) != leader) continue;
+      q->killed = 1;
+      if(q->state == SLEEPING)
+        q->state = RUNNABLE;
     }
+    release(&ptable.lock);
+    return 0;
   }
   release(&ptable.lock);
   return -1;
