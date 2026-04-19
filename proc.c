@@ -589,6 +589,221 @@ kill(int pid)
   return -1;
 }
 
+//PAGEBREAK: 32
+// Thread primitives (see Threads.md).
+//
+// A thread shares its creator's pgdir and sz but owns its own kstack,
+// trap frame, scheduling context, and a private copy of the file
+// descriptor table (seeded by filedup at creation).
+
+// thread_create: spawn a sibling thread in the same group as curproc.
+// entry, stack are user addresses; the new thread begins at entry with
+// %esp pointing one word below stack+stack_size where we have stashed
+// a bogus return PC (0xffffffff) so that a bare "ret" from entry faults
+// clearly instead of silently falling off the stack.
+// Returns 0 and writes the new tid to *out_tid on success; -1 on error.
+int
+thread_create(uint *out_tid, void *entry, void *stack, uint stack_size)
+{
+  struct proc *curproc = myproc();
+  struct proc *leader = thread_leader(curproc);
+  struct proc *nt;
+  uint sp;
+  uint fake_ret = 0xffffffff;
+  int i;
+
+  if(entry == 0 || stack == 0 || stack_size < 4)
+    return -1;
+
+  if((nt = allocproc()) == 0)
+    return -1;
+
+  // Share address space and size with the group.
+  nt->pgdir = leader->pgdir;
+  nt->sz    = leader->sz;
+  nt->parent = leader->parent;
+  *nt->tf = *curproc->tf;
+
+  // Duplicate file/cwd refs so this thread holds its own handles.
+  for(i = 0; i < NOFILE; i++)
+    if(curproc->ofile[i])
+      nt->ofile[i] = filedup(curproc->ofile[i]);
+  nt->cwd = idup(curproc->cwd);
+
+  safestrcpy(nt->name, leader->name, sizeof(nt->name));
+
+  // Plant the fake return address and arrange user entry state.
+  sp = (uint)stack + stack_size - 4;
+  if(copyout(nt->pgdir, sp, &fake_ret, sizeof(fake_ret)) < 0)
+    goto fail;
+  nt->tf->eip = (uint)entry;
+  nt->tf->esp = sp;
+  nt->tf->eax = 0;
+
+  // Hand the tid back to the caller if they asked for it.
+  if(out_tid){
+    if(copyout(leader->pgdir, (uint)out_tid, &nt->pid, sizeof(int)) < 0)
+      goto fail;
+  }
+
+  acquire(&ptable.lock);
+  nt->is_thread = 1;
+  nt->thread_group = leader;
+  nt->thread_count = 0;  // unused on non-leader slots
+  leader->thread_count++;
+  nt->state = RUNNABLE;
+  release(&ptable.lock);
+
+  return 0;
+
+fail:
+  for(i = 0; i < NOFILE; i++)
+    if(nt->ofile[i]){ fileclose(nt->ofile[i]); nt->ofile[i] = 0; }
+  if(nt->cwd){ begin_op(); iput(nt->cwd); end_op(); nt->cwd = 0; }
+  kfree(nt->kstack);
+  nt->kstack = 0;
+  acquire(&ptable.lock);
+  nt->pid = 0;
+  nt->state = UNUSED;
+  release(&ptable.lock);
+  return -1;
+}
+
+// thread_exit: terminate the calling thread, publishing exit_value for
+// any thread_join waiter. If this is the last thread in the group, the
+// parent's wait() unblocks (just like a whole-process exit). This is a
+// thread-scoped termination; it never kills siblings — that is exit().
+void
+thread_exit(void *exit_value)
+{
+  struct proc *curproc = myproc();
+  struct proc *leader = thread_leader(curproc);
+  struct proc *p;
+  int fd;
+
+  if(curproc == initproc)
+    panic("init thread_exit");
+
+  for(fd = 0; fd < NOFILE; fd++){
+    if(curproc->ofile[fd]){
+      fileclose(curproc->ofile[fd]);
+      curproc->ofile[fd] = 0;
+    }
+  }
+
+  begin_op();
+  iput(curproc->cwd);
+  end_op();
+  curproc->cwd = 0;
+
+  acquire(&ptable.lock);
+
+  curproc->thread_exit_value = exit_value;
+  curproc->thread_exited = 1;
+  leader->thread_count--;
+
+  wakeup1(curproc);          // joiners on this thread
+  wakeup1(leader);           // exec/exit waiters on the group
+
+  if(leader->thread_count == 0){
+    // Last member of the group. Tell the parent the process is done
+    // and adopt-out any children the leader still has.
+    for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
+      if(p->parent == leader){
+        p->parent = initproc;
+        if(p->state == ZOMBIE)
+          wakeup1(initproc);
+      }
+    }
+    wakeup1(leader->parent);
+  }
+
+  curproc->state = ZOMBIE;
+  sched();
+  panic("zombie thread_exit");
+}
+
+// thread_join: block until the target thread (must belong to the same
+// group) has exited. On success returns 0 and, if exit_value_ptr is
+// non-NULL, stores the thread's exit value there.
+//
+// Reaping: for a non-leader thread slot we free its kstack and return
+// the slot to UNUSED here. A leader's slot is not reaped here — the
+// parent's wait() owns that to keep the process-level lifecycle intact.
+int
+thread_join(uint tid, void **exit_value_ptr)
+{
+  struct proc *curproc = myproc();
+  struct proc *leader = thread_leader(curproc);
+  struct proc *target;
+  void *ev;
+
+  if(tid == 0 || tid == (uint)curproc->pid)
+    return -1;
+
+  acquire(&ptable.lock);
+  for(target = ptable.proc; target < &ptable.proc[NPROC]; target++){
+    if(target->state != UNUSED && (uint)target->pid == tid)
+      break;
+  }
+  if(target == &ptable.proc[NPROC] || thread_leader(target) != leader){
+    release(&ptable.lock);
+    return -1;
+  }
+
+  while(target->state != ZOMBIE){
+    if(curproc->killed){
+      release(&ptable.lock);
+      return -1;
+    }
+    sleep(target, &ptable.lock);
+    // After wakeup, confirm the slot is still our target — defensive
+    // against theoretical reuse, though the lock prevents it in practice.
+    if((uint)target->pid != tid){
+      release(&ptable.lock);
+      return -1;
+    }
+  }
+
+  ev = target->thread_exit_value;
+
+  if(target->is_thread){
+    kfree(target->kstack);
+    target->kstack = 0;
+    target->pid = 0;
+    target->parent = 0;
+    target->name[0] = 0;
+    target->killed = 0;
+    target->is_thread = 0;
+    target->thread_group = 0;
+    target->thread_count = 0;
+    target->thread_exit_value = 0;
+    target->thread_exited = 0;
+    target->pgdir = 0;
+    target->sz = 0;
+    target->state = UNUSED;
+  }
+  release(&ptable.lock);
+
+  if(exit_value_ptr){
+    // exit_value_ptr lives in our address space (validated by argptr).
+    *exit_value_ptr = ev;
+  }
+  return 0;
+}
+
+uint
+thread_getThreadId(void)
+{
+  return (uint)myproc()->pid;
+}
+
+uint
+thread_getProcessId(void)
+{
+  return (uint)thread_leader(myproc())->pid;
+}
+
 //PAGEBREAK: 36
 // Print a process listing to console.  For debugging.
 // Runs when user types ^P on console.
