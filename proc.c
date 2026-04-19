@@ -804,6 +804,70 @@ thread_getProcessId(void)
   return (uint)thread_leader(myproc())->pid;
 }
 
+// drain_thread_group: called before an image swap to flatten a
+// multi-threaded process into a single-threaded one. Kills all sibling
+// threads in the group and reaps them in place so that when the caller
+// swaps pgdir and frees the old one no thread is left referring to it.
+// On return curproc is the sole member of a fresh single-threaded group.
+//
+// Re-kills on each iteration: a sibling whose syscall was in flight
+// when we first ran may have spawned a new thread before observing
+// killed=1, so we keep sweeping until every non-self slot in the group
+// is ZOMBIE or UNUSED.
+void
+drain_thread_group(void)
+{
+  struct proc *curproc = myproc();
+  struct proc *leader = thread_leader(curproc);
+  struct proc *p;
+
+  acquire(&ptable.lock);
+
+  for(;;){
+    int alive = 0;
+    for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
+      if(p == curproc) continue;
+      if(p->state == UNUSED) continue;
+      if(thread_leader(p) != leader) continue;
+      if(p->state == ZOMBIE) continue;
+      p->killed = 1;
+      if(p->state == SLEEPING)
+        p->state = RUNNABLE;
+      alive++;
+    }
+    if(alive == 0) break;
+    sleep(leader, &ptable.lock);
+  }
+
+  for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
+    if(p == curproc) continue;
+    if(p->state != ZOMBIE) continue;
+    if(thread_leader(p) != leader) continue;
+    kfree(p->kstack);
+    p->kstack = 0;
+    p->pid = 0;
+    p->parent = 0;
+    p->name[0] = 0;
+    p->killed = 0;
+    p->is_thread = 0;
+    p->thread_group = 0;
+    p->thread_count = 0;
+    p->thread_exit_value = 0;
+    p->thread_exited = 0;
+    p->pgdir = 0;
+    p->sz = 0;
+    p->state = UNUSED;
+  }
+
+  curproc->is_thread = 0;
+  curproc->thread_group = 0;
+  curproc->thread_count = 1;
+  curproc->thread_exit_value = 0;
+  curproc->thread_exited = 0;
+
+  release(&ptable.lock);
+}
+
 //PAGEBREAK: 36
 // Print a process listing to console.  For debugging.
 // Runs when user types ^P on console.

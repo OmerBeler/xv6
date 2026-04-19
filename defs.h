@@ -125,6 +125,8 @@ void            thread_exit(void*) __attribute__((noreturn));
 int             thread_join(uint, void**);
 uint            thread_getThreadId(void);
 uint            thread_getProcessId(void);
+void            drain_thread_group(void);
+struct proc*    thread_leader(struct proc*);
 
 // swtch.S
 void            swtch(struct context**, struct context*);

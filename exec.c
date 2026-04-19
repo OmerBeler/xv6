@@ -93,6 +93,10 @@ exec(char *path, char **argv)
       last = s+1;
   safestrcpy(curproc->name, last, sizeof(curproc->name));
 
+  // Threads: flatten the group to just curproc before freeing oldpgdir,
+  // so no sibling thread is running on the memory we are about to reclaim.
+  drain_thread_group();
+
   // Commit to the user image.
   oldpgdir = curproc->pgdir;
   curproc->pgdir = pgdir;
