@@ -215,6 +215,7 @@ fork(void)
   int i, pid;
   struct proc *np;
   struct proc *curproc = myproc();
+  struct proc *leader = thread_leader(curproc);
 
   // Allocate process.
   if((np = allocproc()) == 0){
@@ -222,25 +223,28 @@ fork(void)
   }
 
   // Copy process state from proc.
-  if((np->pgdir = copyuvm(curproc->pgdir, curproc->sz)) == 0){
+  if((np->pgdir = copyuvm(leader->pgdir, leader->sz)) == 0){
     kfree(np->kstack);
     np->kstack = 0;
     np->state = UNUSED;
     return -1;
   }
-  np->sz = curproc->sz;
+  np->sz = leader->sz;
   // Parent is the enclosing process's leader, not the calling thread:
   // the child's lifetime is tied to the process, not to a single thread.
-  np->parent = thread_leader(curproc);
+  np->parent = leader;
   *np->tf = *curproc->tf;
 
   // Clear %eax so that fork returns 0 in the child.
   np->tf->eax = 0;
 
+  // The fd table and cwd are shared group-wide and live on the leader.
+  // Dup from there so the child inherits what the process (not the
+  // calling thread) currently has open.
   for(i = 0; i < NOFILE; i++)
-    if(curproc->ofile[i])
-      np->ofile[i] = filedup(curproc->ofile[i]);
-  np->cwd = idup(curproc->cwd);
+    if(leader->ofile[i])
+      np->ofile[i] = filedup(leader->ofile[i]);
+  np->cwd = idup(leader->cwd);
 
   safestrcpy(np->name, curproc->name, sizeof(curproc->name));
 
@@ -268,25 +272,10 @@ exit(void)
   struct proc *curproc = myproc();
   struct proc *leader = thread_leader(curproc);
   struct proc *p;
-  int fd;
+  int fd, is_last;
 
   if(curproc == initproc)
     panic("init exiting");
-
-  // Close this thread's files and release its cwd. Each thread holds
-  // its own ref (filedup/idup at thread_create time), so every thread
-  // balances the refcount on the way out.
-  for(fd = 0; fd < NOFILE; fd++){
-    if(curproc->ofile[fd]){
-      fileclose(curproc->ofile[fd]);
-      curproc->ofile[fd] = 0;
-    }
-  }
-
-  begin_op();
-  iput(curproc->cwd);
-  end_op();
-  curproc->cwd = 0;
 
   acquire(&ptable.lock);
 
@@ -311,8 +300,30 @@ exit(void)
     }
   }
 
-  // Group bookkeeping: note our departure and wake anyone watching.
   leader->thread_count--;
+  is_last = (leader->thread_count == 0);
+
+  release(&ptable.lock);
+
+  // Last-thread-out closes the shared fd table and releases the cwd.
+  // Earlier exiters leave them intact so surviving threads (which will
+  // reach exit() on their own trap return) can keep using them. The
+  // fileclose/iput calls may sleep, so we drop ptable.lock first.
+  if(is_last){
+    for(fd = 0; fd < NOFILE; fd++){
+      if(leader->ofile[fd]){
+        fileclose(leader->ofile[fd]);
+        leader->ofile[fd] = 0;
+      }
+    }
+    begin_op();
+    iput(leader->cwd);
+    end_op();
+    leader->cwd = 0;
+  }
+
+  acquire(&ptable.lock);
+
   wakeup1(curproc);          // any thread_join on us
   wakeup1(leader);           // any exec/thread_exit waiter on the group
   wakeup1(leader->parent);   // parent's wait() — cheap to call repeatedly
@@ -592,9 +603,9 @@ kill(int pid)
 //PAGEBREAK: 32
 // Thread primitives (see Threads.md).
 //
-// A thread shares its creator's pgdir and sz but owns its own kstack,
-// trap frame, scheduling context, and a private copy of the file
-// descriptor table (seeded by filedup at creation).
+// A thread shares its creator's pgdir and sz and the group-wide fd
+// table and cwd (which live on the leader), but owns its own kstack,
+// trap frame, and scheduling context.
 
 // thread_create: spawn a sibling thread in the same group as curproc.
 // entry, stack are user addresses; the new thread begins at entry with
@@ -610,7 +621,6 @@ thread_create(uint *out_tid, void *entry, void *stack, uint stack_size)
   struct proc *nt;
   uint sp;
   uint fake_ret = 0xffffffff;
-  int i;
 
   if(entry == 0 || stack == 0 || stack_size < 4)
     return -1;
@@ -618,17 +628,13 @@ thread_create(uint *out_tid, void *entry, void *stack, uint stack_size)
   if((nt = allocproc()) == 0)
     return -1;
 
-  // Share address space and size with the group.
+  // Share address space with the group. Files and cwd are reached via
+  // thread_leader(nt) from sysfile.c / fs.c, so non-leader thread slots
+  // intentionally leave their ofile[] empty and cwd NULL.
   nt->pgdir = leader->pgdir;
   nt->sz    = leader->sz;
   nt->parent = leader->parent;
   *nt->tf = *curproc->tf;
-
-  // Duplicate file/cwd refs so this thread holds its own handles.
-  for(i = 0; i < NOFILE; i++)
-    if(curproc->ofile[i])
-      nt->ofile[i] = filedup(curproc->ofile[i]);
-  nt->cwd = idup(curproc->cwd);
 
   safestrcpy(nt->name, leader->name, sizeof(nt->name));
 
@@ -657,9 +663,6 @@ thread_create(uint *out_tid, void *entry, void *stack, uint stack_size)
   return 0;
 
 fail:
-  for(i = 0; i < NOFILE; i++)
-    if(nt->ofile[i]){ fileclose(nt->ofile[i]); nt->ofile[i] = 0; }
-  if(nt->cwd){ begin_op(); iput(nt->cwd); end_op(); nt->cwd = 0; }
   kfree(nt->kstack);
   nt->kstack = 0;
   acquire(&ptable.lock);
@@ -679,35 +682,20 @@ thread_exit(void *exit_value)
   struct proc *curproc = myproc();
   struct proc *leader = thread_leader(curproc);
   struct proc *p;
-  int fd;
+  int fd, is_last;
 
   if(curproc == initproc)
     panic("init thread_exit");
-
-  for(fd = 0; fd < NOFILE; fd++){
-    if(curproc->ofile[fd]){
-      fileclose(curproc->ofile[fd]);
-      curproc->ofile[fd] = 0;
-    }
-  }
-
-  begin_op();
-  iput(curproc->cwd);
-  end_op();
-  curproc->cwd = 0;
 
   acquire(&ptable.lock);
 
   curproc->thread_exit_value = exit_value;
   curproc->thread_exited = 1;
   leader->thread_count--;
+  is_last = (leader->thread_count == 0);
 
-  wakeup1(curproc);          // joiners on this thread
-  wakeup1(leader);           // exec/exit waiters on the group
-
-  if(leader->thread_count == 0){
-    // Last member of the group. Tell the parent the process is done
-    // and adopt-out any children the leader still has.
+  if(is_last){
+    // Adopt-out any children the leader still has.
     for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
       if(p->parent == leader){
         p->parent = initproc;
@@ -715,8 +703,31 @@ thread_exit(void *exit_value)
           wakeup1(initproc);
       }
     }
-    wakeup1(leader->parent);
   }
+
+  release(&ptable.lock);
+
+  // Last-thread-out releases the shared fd table and cwd. Others leave
+  // them intact for surviving threads to continue using.
+  if(is_last){
+    for(fd = 0; fd < NOFILE; fd++){
+      if(leader->ofile[fd]){
+        fileclose(leader->ofile[fd]);
+        leader->ofile[fd] = 0;
+      }
+    }
+    begin_op();
+    iput(leader->cwd);
+    end_op();
+    leader->cwd = 0;
+  }
+
+  acquire(&ptable.lock);
+
+  wakeup1(curproc);          // joiners on this thread
+  wakeup1(leader);           // exec/exit waiters on the group
+  if(is_last)
+    wakeup1(leader->parent); // parent's wait() — only unblocks on last
 
   curproc->state = ZOMBIE;
   sched();
@@ -820,6 +831,7 @@ drain_thread_group(void)
   struct proc *curproc = myproc();
   struct proc *leader = thread_leader(curproc);
   struct proc *p;
+  int fd;
 
   acquire(&ptable.lock);
 
@@ -837,6 +849,19 @@ drain_thread_group(void)
     }
     if(alive == 0) break;
     sleep(leader, &ptable.lock);
+  }
+
+  // If curproc is a non-leader thread, the shared fd table and cwd
+  // live on the leader's slot — which we are about to reap. Move
+  // them onto curproc, which becomes the new leader below. A pure
+  // pointer transfer; no refcount changes, no sleeping calls.
+  if(curproc != leader){
+    for(fd = 0; fd < NOFILE; fd++){
+      curproc->ofile[fd] = leader->ofile[fd];
+      leader->ofile[fd] = 0;
+    }
+    curproc->cwd = leader->cwd;
+    leader->cwd = 0;
   }
 
   for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
