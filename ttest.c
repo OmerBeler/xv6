@@ -4,6 +4,7 @@
 #include "types.h"
 #include "stat.h"
 #include "user.h"
+#include "fcntl.h"
 
 #define STACK_SIZE 4096
 
@@ -110,6 +111,103 @@ test_main_thread_exit(void)
 }
 
 static void *
+fd_opener(void)
+{
+  // Open a fresh file and hand the descriptor back via the exit value.
+  // With a shared fd table, the calling thread can read/write through
+  // this descriptor even though we are the one who opened it.
+  int fd = open("ttestfd", O_CREATE | O_RDWR);
+  thread_exit((void*)fd);
+}
+
+static void
+test_shared_fds(void)
+{
+  tid_t t;
+  void *ev = 0;
+  int fd, n;
+  char buf[8];
+
+  printf(1, "test_shared_fds... ");
+  unlink("ttestfd");
+
+  if(thread_create(&t, fd_opener, stacks[0], STACK_SIZE) < 0){
+    printf(1, "FAIL create\n"); return;
+  }
+  if(thread_join(t, &ev) < 0){ printf(1, "FAIL join\n"); return; }
+  fd = (int)ev;
+  if(fd < 0){
+    printf(1, "FAIL worker open failed\n");
+    unlink("ttestfd"); return;
+  }
+
+  // Per-thread fd tables would make this fd invalid for us (the opener
+  // is gone). Shared fd table: the slot survives on the leader.
+  if(write(fd, "hi!", 3) != 3){
+    printf(1, "FAIL main can't write to worker-opened fd %d\n", fd);
+    unlink("ttestfd"); return;
+  }
+  close(fd);
+
+  if((fd = open("ttestfd", O_RDONLY)) < 0){
+    printf(1, "FAIL reopen\n"); unlink("ttestfd"); return;
+  }
+  n = read(fd, buf, sizeof(buf));
+  close(fd);
+  unlink("ttestfd");
+  if(n != 3 || buf[0] != 'h' || buf[1] != 'i' || buf[2] != '!'){
+    printf(1, "FAIL content mismatch (n=%d)\n", n); return;
+  }
+  printf(1, "ok\n");
+}
+
+static void *
+cwd_changer(void)
+{
+  // Flip the group cwd back to "/". A shared cwd means the main
+  // thread's next relative lookup starts from "/".
+  chdir("/");
+  thread_exit(0);
+}
+
+static void
+test_shared_cwd(void)
+{
+  tid_t t;
+  void *ev = 0;
+
+  printf(1, "test_shared_cwd... ");
+  mkdir("ttestdir");  // best-effort; may already exist from a prior run
+  if(chdir("ttestdir") < 0){
+    printf(1, "FAIL chdir into ttestdir\n");
+    unlink("ttestdir"); return;
+  }
+
+  // cwd is now /ttestdir. Worker changes it to /; with a shared cwd
+  // we must observe that on return.
+  if(thread_create(&t, cwd_changer, stacks[0], STACK_SIZE) < 0){
+    printf(1, "FAIL create\n");
+    chdir("/"); unlink("ttestdir"); return;
+  }
+  if(thread_join(t, &ev) < 0){
+    printf(1, "FAIL join\n");
+    chdir("/"); unlink("ttestdir"); return;
+  }
+
+  // If cwd were per-thread we would still be in /ttestdir, so the
+  // relative name "ttestdir" would resolve to /ttestdir/ttestdir
+  // (which does not exist) and chdir would fail.
+  if(chdir("ttestdir") < 0){
+    printf(1, "FAIL cwd not shared (worker's chdir('/') invisible to main)\n");
+    chdir("/"); unlink("ttestdir"); return;
+  }
+
+  chdir("/");
+  unlink("ttestdir");
+  printf(1, "ok\n");
+}
+
+static void *
 process_killer(void)
 {
   exit();  // kills the entire process
@@ -142,6 +240,8 @@ main(int argc, char *argv[])
   test_ids();
   test_main_thread_exit();
   test_exit_from_thread();
+  test_shared_fds();
+  test_shared_cwd();
   printf(1, "ttest: done\n");
   exit();
 }
