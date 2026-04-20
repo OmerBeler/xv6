@@ -64,15 +64,23 @@ Threads in the same group share:
 
 - the page directory (`pgdir`) and address-space size (`sz`)
 - the `parent` pointer (the enclosing process's parent)
+- the open-file table (`ofile[]`) and working directory (`cwd`) — these
+  live on the group leader's `struct proc` and every access from any
+  thread in the group (syscalls in `sysfile.c`, path lookups in
+  `fs.c`) goes through `thread_leader()`. Opens, closes, dups, and
+  `chdir` from one thread are visible to every sibling. This matches
+  POSIX pthread semantics.
 
 Threads do **not** share:
 
-- the open-file table — each thread gets a private `ofile[]` seeded at
-  `thread_create` time via `filedup` on every fd, and its own `cwd`
-  via `idup`. This differs from POSIX (where threads share fds); it is
-  a deliberate teaching-OS simplification so the existing xv6 file
-  ref-counting continues to work without a new layer of indirection.
 - the kernel stack, trap frame, or scheduling context.
+
+Concurrency note: the fd-table slot assignment in `fdalloc` (and the
+matching `ofile[fd] = 0` in `sys_close`/`sys_pipe`'s failure path) is
+not serialized beyond what the caller already owns. Two sibling
+threads that simultaneously `open` may race on the first free slot;
+the teaching implementation does not add a lock for this and expects
+user code to coordinate when it matters.
 
 ### Leader vs thread slots
 
@@ -95,14 +103,14 @@ struct proc *thread_leader(struct proc *p) {
 
 | Event | Effect |
 |-------|--------|
-| `thread_create` | allocate a slot, share pgdir/sz, filedup the fds, idup the cwd, `leader->thread_count++`, RUNNABLE |
-| `thread_exit` | close own fds, iput own cwd, record exit value, `leader->thread_count--`, wake joiner + group chan + parent-if-last, ZOMBIE |
+| `thread_create` | allocate a slot, share pgdir/sz (fd table and cwd are reached via the leader, not duplicated), `leader->thread_count++`, RUNNABLE |
+| `thread_exit` | record exit value, `leader->thread_count--`; if that leaves the group empty, close the leader's fds and iput its cwd; wake joiner + group chan + parent-if-last, ZOMBIE |
 | `thread_join` (non-leader target) | sleep on target; on ZOMBIE read the exit value, `kfree(kstack)`, reset fields, UNUSED |
 | `thread_join` (leader target) | same, but leader slot is **not** reaped here — the parent's `wait()` owns the process-level reap |
-| `exit()` from any thread | kills every group member (killed=1, SLEEPING->RUNNABLE); each member runs its own `exit()` on trap return and closes its own fds/cwd before going ZOMBIE |
+| `exit()` from any thread | kills every group member (killed=1, SLEEPING->RUNNABLE); each member runs its own `exit()` on trap return, decrements the group counter, and the last one out closes the leader's shared fds/cwd before going ZOMBIE |
 | parent's `wait()` | skips `is_thread` slots; for a ZOMBIE leader, only reaps when every group member is ZOMBIE, then reaps the whole group and `freevm`s the shared pgdir once |
 | `kill(pid)` | POSIX-like: kills the whole group, not just one thread |
-| image swap from any thread | drains the group (kills and reaps all siblings) just before the pgdir swap, so no thread is left running on the memory we're about to free |
+| image swap from any thread | drains the group (kills and reaps all siblings) just before the pgdir swap; if the caller is not the original leader, the fd table and cwd are moved onto the caller's slot before the leader is reaped, so no shared state is lost |
 
 ### `sbrk`/`growproc`
 
@@ -131,12 +139,16 @@ thread's own id use `thread_getThreadId()`.
 ## Locking notes
 
 - `ptable.lock` guards any observation of thread state (`is_thread`,
-  `thread_group`, `thread_count`, `state`, `killed`).
-- `filedup`, `idup`, `fileclose`, `iput` must be called **without**
-  holding `ptable.lock` — they may acquire buffer-cache sleep locks.
-  `thread_create` does file/inode refcount work before acquiring the
-  lock to set `RUNNABLE`; `thread_exit`/`exit` do it before acquiring
-  the lock and then complete bookkeeping inside it.
+  `thread_group`, `thread_count`, `state`, `killed`). It also protects
+  `leader->thread_count` under decrement/`is_last` reads in
+  `exit`/`thread_exit`.
+- `fileclose` and `iput` must be called **without** holding
+  `ptable.lock` — they may acquire buffer-cache sleep locks. The
+  last-thread-out path in `exit`/`thread_exit` therefore drops
+  `ptable.lock` around the fd/cwd cleanup, then reacquires it for the
+  final state transition and wakeups. The shared `leader->ofile[]` is
+  safe to touch without the lock at that point because the caller was
+  observed to be the last live member of the group.
 - `sleep` chans in use:
   - `target` (a thread slot) — `thread_join` waits, `thread_exit`
     wakes.
@@ -147,10 +159,13 @@ thread's own id use `thread_getThreadId()`.
 
 ## Known limitations
 
-- **Per-thread file descriptor tables**: not POSIX. A thread that
-  opens an fd cannot be observed by another thread in the same
-  process. Useful for teaching; replace with a shared fd table if
-  you want POSIX-pthread semantics.
+- **Fd-table operations are not internally synchronized**: `open`,
+  `dup`, and `close` from multiple threads race on the shared
+  `ofile[]` slot assignment. The individual file structs are
+  refcounted safely (they live behind `ftable.lock`), but the
+  "which slot do I land in" decision in `fdalloc` is not atomic
+  with the subsequent assignment. Coordinate at the user level or
+  add a group-level lock if you need sharper guarantees.
 - **Stack is caller-provided and never freed**: `thread_create`
   trusts the caller to allocate and (after join) free the user stack.
   There is no guard page.
